@@ -29,19 +29,30 @@ that must always track the warehouse, or `overwrite` by default with a
 | text (`TEXT`, `VARCHAR`, `CHAR(n)`, ...) | `NULL`, `''`, or **only spaces** |
 | any other type (integer, boolean, date, ...) | `NULL` only |
 
-A stored `0` or `false` is a **value**, not empty, so it is kept. Spaces-only
-counts as empty because a `CHAR(n)` column pads with spaces and the database cannot
-tell padding from content; a tab or a newline is a value. (The comparison casts the
-column to text and trims spaces for the check only; the column's own type is never
-changed. The diff reads the destination value and applies the same rule, so
-`--dry-run --diff` and `drt plan` agree with the write.) Binary columns (`bytea`,
-`BLOB`, Snowflake `BINARY`) are not meaningful here: leave them on `overwrite`.
-On Snowflake, `VARIANT` / `OBJECT` / `ARRAY` columns count as empty only when SQL
-`NULL` (a stored JSON `""` is a value), and the destination must use
+A stored `0`, `false`, empty binary value, or non-NULL semi-structured value is a
+**value**, not empty, so it is kept. Spaces-only counts as empty for text because a
+`CHAR(n)` column pads with spaces and the database cannot tell padding from content;
+a tab or a newline is a value. The write tests the column's own database type before
+trimming, and the diff reads the destination value and applies the same rule, so
+`--dry-run --diff` and `drt plan` agree with the write. Every non-text column —
+binary, numeric, boolean, date/time, array, map, struct, object, or variant — is
+empty only when SQL `NULL`.
+
+On Snowflake, `VARIANT` / `OBJECT` / `ARRAY` columns therefore count as empty only
+when SQL `NULL` (a stored JSON `""` is a value; this relies on schema introspection,
+which is on by default), and the destination must use
 `mode: merge` (or `sync.mode: mirror`): `mode: insert` only appends, so
 `fill_empty` is refused there rather than ignored. Repeated source keys in one
 Snowflake batch are not collapsed (as with `overwrite`): keep the model output
 unique per `upsert_key`.
+
+Databricks has the same `mode: merge` requirement (`sync.mode: mirror` forces
+that path). Its `STRUCT` / `ARRAY` / `MAP` / `VARIANT` columns are empty only
+when SQL `NULL`; a stored semi-structured empty string, array, map or struct is a
+value. Databricks stages each destination batch and runs one Delta `MERGE`,
+without collapsing repeated keys. If multiple source rows in that batch match
+the same existing target row, Delta rejects the ambiguous update; keep model
+output unique per `upsert_key`.
 
 ## Behaviour
 
@@ -50,9 +61,9 @@ unique per `upsert_key`.
 - **Key columns** are never updated, so the policy never applies to them.
 - Works with `match_policy: upsert` on every destination listed below, and with
   `update_only` on PostgreSQL and MySQL (a missing row is still skipped, never
-  created). Snowflake does not implement `update_only`; its existing engine
-  guard refuses that policy before any I/O. `create_only` never updates, so
-  there is nothing to fill.
+  created). Snowflake and Databricks do not implement `update_only`; their
+  existing engine guard refuses that policy before any I/O. `create_only` never
+  updates, so there is nothing to fill.
 - `mode: replace` is rejected: it rebuilds the table, so there is no existing
   value to keep.
 - A name in `write_policy_overrides` that is not a column of the destination
@@ -75,7 +86,8 @@ unique per `upsert_key`.
 | PostgreSQL | yes: in the `ON CONFLICT ... DO UPDATE` expression (and `UPDATE` for `update_only`), no extra round trip |
 | MySQL | yes: in the `ON DUPLICATE KEY UPDATE` expression (and `UPDATE` for `update_only`) |
 | Snowflake | yes: in the VALUES-sourced `MERGE` update expression (including `mode: mirror` before its unchanged delete pass); requires the destination's `mode: merge` for ordinary upserts |
-| Others | refused up front with a clear message, never silently overwritten. Databricks, BigQuery and HubSpot follow ([#1238](https://github.com/drt-hub/drt/issues/1238)). |
+| Databricks | yes: in the staging-sourced Delta `MERGE`, composed with sparse-row presence flags (including `mode: mirror` before its unchanged delete pass); requires the destination's `mode: merge` for ordinary upserts |
+| Others | refused up front with a clear message, never silently overwritten. BigQuery and HubSpot follow ([#1238](https://github.com/drt-hub/drt/issues/1238)). |
 
 The generated SQL for a fill column is, for Postgres (the target is aliased,
 because an unqualified column is ambiguous with `EXCLUDED`),
@@ -84,6 +96,9 @@ and for MySQL
 `col = IF(col IS NULL OR TRIM(CAST(col AS CHAR)) = '', VALUES(col), col)`. Snowflake's
 equivalent is
 `col = CASE WHEN target.col IS NULL OR TRIM(target.col::STRING) = '' THEN source.col ELSE target.col END`.
+Databricks uses
+`col = CASE WHEN target.col IS NULL OR ((typeof(target.col) LIKE 'string%' OR typeof(target.col) LIKE 'varchar%' OR typeof(target.col) LIKE 'char%') AND TRIM(CAST(target.col AS STRING)) = '') THEN <presence-aware source expression> ELSE target.col END`,
+so a sparse row that omitted the column still preserves the target value.
 
 ## Seeing what is kept
 
