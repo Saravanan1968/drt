@@ -280,6 +280,9 @@ sync:                       # optional: all fields have defaults
   mode: full                # "full" (default) | "incremental" | "upsert" | "replace" | "mirror". replace/mirror: Postgres, MySQL, ClickHouse, Snowflake, Databricks, BigQuery
   replace_strategy: truncate # "truncate" (default) | "swap"; only valid with mode: replace
   match_policy: upsert      # optional (#757): "upsert" (default) | "update_only" (only touch rows that already exist — no-match rows are SKIPPED, counted in SyncResult.skipped with a skipped_no_match breakdown; `drt run` prints "N skipped (M no match)" and --output json adds rows_skipped / rows_skipped_no_match) | "create_only" (only insert rows that don't exist — existing rows untouched). Applies to the upsert write path (mode: full/upsert/incremental); rejected for replace/mirror; fails fast on destinations that don't implement it. Postgres + MySQL + HubSpot + Intercom; other SaaS destinations follow per-PR
+  write_policy: overwrite  # optional (#1238): "overwrite" (default) | "fill_empty"; fill only NULL/blank destination values, new rows in full; rejected for replace
+  write_policy_overrides:  # optional: exact destination column/property name -> policy
+    lifecycle_stage: overwrite
   mirror:                   # optional (#686): mirror-mode delete behaviour — only valid with mode: mirror
     strategy: destination   # "destination" (default: compare with whole target) | "tracked" (delete only drt-owned keys; unsupported on BigQuery) | "diff" (delete exact source-snapshot removals)
     scope: [parent_id]      # optional: restrict deletes to observed scope values. Works with destination/tracked; tracked+scope on Postgres/MySQL/Snowflake/ClickHouse/Databricks. Rejected with strategy: diff
@@ -406,9 +409,11 @@ non-text column is empty only when NULL; a stored `0` is a value. Supported on
 **PostgreSQL and MySQL** (upsert and `update_only`), **Snowflake** (the upsert
 `MERGE` path, including mirror), and **Databricks** (the staging-sourced Delta
 `MERGE`, composed with sparse-row presence flags, including mirror), and
-**BigQuery** (each typed-temp-table sparse `MERGE`, including mirror). Snowflake,
-Databricks, and BigQuery do not support `update_only`; other destinations fail
-fast. All three require destination `mode: merge` for an ordinary upsert
+**BigQuery** (each typed-temp-table sparse `MERGE`, including mirror), and
+**HubSpot** (fail-closed batch read of ≤100 IDs, then filtered PATCH; new records
+POSTed in full). Snowflake, Databricks, and BigQuery do not support `update_only`;
+HubSpot does. Other destinations fail fast. The three warehouse destinations
+require destination `mode: merge` for an ordinary upsert
 (`sync.mode: mirror` forces it); `mode: insert` is refused rather than silently
 ignoring the policy. Databricks and BigQuery semi-structured columns are empty
 only when SQL NULL. BigQuery determines text columns from the target schema. If
@@ -417,13 +422,19 @@ there is no schema yet; any other schema lookup failure fails the batch.
 Duplicate source keys that match one target row can make Databricks or BigQuery
 reject the ambiguous `MERGE`. Destination diff/plan applies `fill_empty`, validates
 source override names, counts `kept_values`, and models repeated keys as
-first-writer-wins only for PostgreSQL, MySQL, Snowflake, and Databricks. BigQuery
-is not a queryable destination, so `drt plan` and `--dry-run --diff` report it as
-unsupported and do none of those preview operations.
+first-writer-wins only for PostgreSQL, MySQL, Snowflake, and Databricks. HubSpot
+models repeated IDs first-writer-wins in its live read/filter path and reports
+exact kept-property counts in `SyncResult.kept_values`. BigQuery and HubSpot are
+not queryable destinations, so `drt plan` and `--dry-run --diff` report them as
+unsupported and do none of those preview operations (HubSpot API-backed diff is
+tracked by #472).
 Rejected for `mode: replace`. A name in `write_policy_overrides` that is not a
 column of the destination table is an error (nothing written; needs introspection),
 and supported plan/diff destinations report it as unavailable when the source does
-not produce it.
+not produce it. HubSpot instead validates exact, case-sensitive override names
+once against its properties API when the token has schema access; 401/403/404,
+unusable responses, transport failures, and exhausted 5xx retries skip this
+best-effort validation with a warning.
 
 ```yaml
 sync:
@@ -924,6 +935,31 @@ destination:
     type: bearer
     token_env: HUBSPOT_TOKEN      # Private App token with CRM write scope
 ```
+
+HubSpot supports `sync.write_policy: fill_empty` for `mode: full`, `upsert`, and
+`incremental`, including `write_policy_overrides` and every `match_policy`. It
+performs one rate-limited, retried batch read per ≤100 rendered records. A 207 is
+accepted only when absent results have `OBJECT_NOT_FOUND` errors whose non-empty
+ID lists contain only requested inputs; one error may group multiple IDs. Any
+other error, status absent or not exactly `COMPLETE`, or missing/malformed
+`results` fails the group closed. Batch read and PATCH-by-`idProperty` require a
+unique-valued property or `hs_object_id`; a non-unique property such as
+`dealname` produces row errors and no writes. Existing non-empty fill-only
+properties are omitted from PATCH, while
+new records are POSTed in full; a POST-409 create race is a row error that asks
+the operator to re-run, never an unfiltered PATCH.
+
+Property names are lowercase and case-sensitive. Override names are checked once
+per object type and resolved token through the properties API when accessible,
+and validation is skipped with a warning otherwise. Duplicate IDs within one
+load are first-writer-wins; across engine batches they rely on the next read
+seeing the previous write, so a small stale window is possible. Rate limiting
+counts logical operations, not internal
+retries or the default-policy POST-409-to-PATCH fallback. A row with nothing to
+write beyond `id_property` is skipped without incrementing `skipped_no_match`;
+the aggregated `SyncResult.kept_values` counts kept properties and `drt run`
+prints them. This leg is mock-verified only, not verified against a live HubSpot
+account. HubSpot has no `drt plan` / `--dry-run --diff` support today (#472).
 
 ### `type: zendesk`
 
