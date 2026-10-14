@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from drt.config.sync_options import GuardsConfig, SyncOptions
 from drt.engine.diff import DiffResult
-from drt.engine.guards import evaluate_guards
+from drt.engine.guards import GuardTripped, enforce_delete_guards, evaluate_guards
 from drt.engine.plan import build_plan, render_markdown, render_text
 
 _COUNTS: dict[str, Any] = {
@@ -114,6 +114,7 @@ def test_plan_reports_tripped_guards_in_json_text_and_markdown() -> None:
     plan = build_plan(_mirror_diff(20), **_BASE, guards=guards)
 
     data = plan.to_dict()
+    assert data["summary"]["delete_baseline"] == 100
     assert data["guards"]["configured"] == {"max_deletes": 5, "max_delete_pct": 50.0}
     assert [t["guard"] for t in data["guards"]["tripped"]] == ["max_deletes"]
     assert "GUARD TRIPPED" in render_text(plan)
@@ -133,7 +134,105 @@ def test_percentage_limits_are_compared_without_rounding() -> None:
     assert _eval(GuardsConfig(max_delete_pct=0), deletes=1, delete_baseline=20_001)
     # 1 in 300 is 0.3333...%, above a 0.33 limit although it rounds to 0.33.
     assert _eval(GuardsConfig(max_delete_pct=0.33), deletes=1, delete_baseline=300)
+    # Decimal(str(limit)) keeps a decimal boundary exact: binary float would
+    # make 0.29 * 100000 slightly smaller and falsely trip the equal case.
+    assert _eval(GuardsConfig(max_delete_pct=0.29), deletes=290, delete_baseline=100_000) == []
+    assert _eval(GuardsConfig(max_delete_pct=0.29), deletes=291, delete_baseline=100_000)
     assert _eval(GuardsConfig(max_updates_pct=0), updates=1, source_rows=20_001)
     # Exactly at the limit is within it.
     assert _eval(GuardsConfig(max_delete_pct=25), deletes=1, delete_baseline=4) == []
     assert _eval(GuardsConfig(max_delete_pct=0), deletes=0) == []
+
+
+def test_runtime_enforcement_only_judges_delete_guards() -> None:
+    guards = GuardsConfig(
+        max_creates=0,
+        max_deletes=1,
+        max_delete_pct=50,
+        max_updates_pct=0,
+    )
+
+    assert enforce_delete_guards(guards, deletes=1, baseline=2, force=False) == []
+    with pytest.raises(GuardTripped) as raised:
+        enforce_delete_guards(guards, deletes=2, baseline=2, force=False)
+
+    assert [trip.guard for trip in raised.value.trips] == [
+        "max_deletes",
+        "max_delete_pct",
+    ]
+    assert "observed" not in str(raised.value)  # messages carry the concrete values instead
+    assert "2 rows (limit 1)" in str(raised.value)
+
+
+def test_runtime_force_returns_trips_and_diff_pct_fails_closed() -> None:
+    guards = GuardsConfig(max_delete_pct=10)
+
+    trips = enforce_delete_guards(guards, deletes=1, baseline=None, force=True)
+
+    assert len(trips) == 1
+    assert trips[0].guard == "max_delete_pct"
+    assert trips[0].observed is None
+    assert "cannot be evaluated" in trips[0].message
+    assert enforce_delete_guards(None, deletes=10, baseline=None, force=False) == []
+
+
+def test_apply_force_is_bounded_by_reviewed_delete_observations() -> None:
+    guards = GuardsConfig(max_deletes=1, max_delete_pct=40)
+
+    forced = enforce_delete_guards(
+        guards,
+        deletes=2,
+        baseline=4,
+        force=True,
+        reviewed_deletes=2,
+        reviewed_baseline=4,
+        reviewed_guards={"max_deletes", "max_delete_pct"},
+    )
+    assert [trip.guard for trip in forced] == ["max_deletes", "max_delete_pct"]
+
+    with pytest.raises(GuardTripped, match="Re-run `drt plan`") as larger_count:
+        enforce_delete_guards(
+            guards,
+            deletes=3,
+            baseline=4,
+            force=True,
+            reviewed_deletes=2,
+            reviewed_baseline=4,
+            reviewed_guards={"max_deletes", "max_delete_pct"},
+        )
+    assert [trip.observed for trip in larger_count.value.trips] == [3, 75.0]
+
+    with pytest.raises(GuardTripped, match="Re-run `drt plan`"):
+        enforce_delete_guards(
+            GuardsConfig(max_delete_pct=40),
+            deletes=2,
+            baseline=3,
+            force=True,
+            reviewed_deletes=2,
+            reviewed_baseline=4,
+            reviewed_guards={"max_delete_pct"},
+        )
+
+
+def test_apply_force_does_not_waive_a_guard_absent_from_review() -> None:
+    with pytest.raises(GuardTripped, match="Re-run `drt plan`"):
+        enforce_delete_guards(
+            GuardsConfig(max_deletes=1),
+            deletes=2,
+            baseline=3,
+            force=True,
+            reviewed_deletes=2,
+            reviewed_baseline=3,
+            reviewed_guards=set(),
+        )
+
+    with pytest.raises(GuardTripped, match="Re-run `drt plan`"):
+        enforce_delete_guards(
+            GuardsConfig(max_delete_pct=10),
+            deletes=3,
+            baseline=None,
+            force=True,
+            reviewed_deletes=2,
+            reviewed_baseline=None,
+            reviewed_guards={"max_delete_pct"},
+        )

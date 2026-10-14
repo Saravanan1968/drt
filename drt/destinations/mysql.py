@@ -448,6 +448,131 @@ class MySQLDestination(BaseSqlDestination):
             params = scope_params + [v for key in keys for v in key]
         return stmt, params
 
+    def _supports_runtime_delete_guards(self) -> bool:
+        return True
+
+    def _ensure_runtime_guard_transactionality(
+        self,
+        cur: Any,
+        tables: list[tuple[str, str]],
+    ) -> None:
+        """Require InnoDB wherever a guard refusal depends on rollback."""
+        for table, role in tables:
+            params: tuple[str, ...]
+            if "." in table:
+                database, relation = table.rsplit(".", 1)
+                schema_clause = "table_schema = %s"
+                params = (database, relation)
+            else:
+                relation = table
+                schema_clause = "table_schema = DATABASE()"
+                params = (relation,)
+            try:
+                cur.execute(
+                    "SELECT engine FROM information_schema.tables "
+                    f"WHERE {schema_clause} AND table_name = %s",
+                    params,
+                )
+                row = cur.fetchone()
+            except Exception as error:
+                raise RuntimeError(
+                    "MySQL run-time change guards could not verify the storage engine for "
+                    f"{role} {table!r}; refusing destructive finalization because rollback "
+                    "safety is unknown."
+                ) from error
+            engine = str(row[0]) if row and row[0] is not None else None
+            if engine is None or engine.casefold() != "innodb":
+                found = engine or "unknown/missing"
+                raise RuntimeError(
+                    "MySQL run-time change guards require InnoDB for "
+                    f"{role} {table!r}; found {found}. Refusing destructive finalization "
+                    "because a guard-triggered DELETE must be rollback-safe."
+                )
+
+    def _build_mirror_count(
+        self,
+        table: str,
+        upsert_cols: list[str],
+        keys: list[tuple[Any, ...]],
+        scope_cols: list[str] | None = None,
+        scopes: list[tuple[Any, ...]] | None = None,
+        negate: bool = True,
+        *,
+        baseline: bool = False,
+    ) -> tuple[Any, Any]:
+        """Count the exact MySQL mirror predicate (or scoped baseline)."""
+        table_q = self._quote_ident(table)
+        scope_predicate = ""
+        scope_params: list[Any] = []
+        if scope_cols and scopes:
+            if len(scope_cols) == 1:
+                placeholders = ", ".join(["%s"] * len(scopes))
+                scope_predicate = f"`{scope_cols[0]}` IN ({placeholders})"
+                scope_params = [scope[0] for scope in scopes]
+            else:
+                scope_tuple = "(" + ", ".join(f"`{col}`" for col in scope_cols) + ")"
+                row = "(" + ", ".join(["%s"] * len(scope_cols)) + ")"
+                placeholders = ", ".join([row] * len(scopes))
+                scope_predicate = f"{scope_tuple} IN ({placeholders})"
+                scope_params = [value for scope in scopes for value in scope]
+
+        if baseline:
+            where = f" WHERE {scope_predicate}" if scope_predicate else ""
+            return f"SELECT COUNT(*) FROM {table_q}{where}", scope_params
+
+        op = "NOT IN" if negate else "IN"
+        if len(upsert_cols) == 1:
+            placeholders = ", ".join(["%s"] * len(keys))
+            key_predicate = f"`{upsert_cols[0]}` {op} ({placeholders})"
+            key_params = [key[0] for key in keys]
+        else:
+            key_tuple = "(" + ", ".join(f"`{col}`" for col in upsert_cols) + ")"
+            row = "(" + ", ".join(["%s"] * len(upsert_cols)) + ")"
+            placeholders = ", ".join([row] * len(keys))
+            key_predicate = f"{key_tuple} {op} ({placeholders})"
+            key_params = [value for key in keys for value in key]
+        predicate = f"{scope_predicate} AND {key_predicate}" if scope_predicate else key_predicate
+        return (
+            f"SELECT COUNT(*) FROM {table_q} WHERE {predicate}",
+            scope_params + key_params,
+        )
+
+    def _build_table_count(self, table: str) -> Any:
+        return f"SELECT COUNT(*) FROM {self._quote_ident(table)}"
+
+    def _build_swap_delete_count(self, table: str, shadow: str, upsert_cols: list[str]) -> Any:
+        """Count live keys absent from the shadow using MySQL's ``<=>``."""
+        equality = " AND ".join(f"l.`{col}` <=> s.`{col}`" for col in upsert_cols)
+        return (
+            f"SELECT COUNT(*) FROM {self._quote_ident(table)} AS l WHERE NOT EXISTS "
+            f"(SELECT 1 FROM {self._quote_ident(shadow)} AS s WHERE {equality})"
+        )
+
+    def _lock_swap_tables(self, cur: Any, table: str, shadow: str) -> None:
+        """Take MySQL's strongest table locks around guarded count + rename.
+
+        MySQL DDL is not transactional. ``LOCK TABLES`` closes the ordinary
+        writer window before the count, but metadata-lock/DDL failure behavior
+        still cannot provide PostgreSQL's rollback guarantee; the operator
+        guide documents that residual explicitly.
+        """
+        cur.execute(
+            f"LOCK TABLES {self._quote_ident(table)} WRITE, {self._quote_ident(shadow)} WRITE"
+        )
+
+    def _unlock_swap_tables(self, conn: Any) -> None:
+        try:
+            conn.cursor().execute("UNLOCK TABLES")
+        except Exception as error:  # noqa: BLE001 — preserve swap/guard outcome
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "failed to release MySQL replace-swap table locks: %s", error
+            )
+
+    def _build_drop_table(self, table: str) -> Any:
+        return f"DROP TABLE IF EXISTS {self._quote_ident(table)}"
+
     # --- tracked-mirror state hooks (#686 / #695, #719 phase 2b) -----------
     def _state_table_ident(self, config: Any) -> tuple[Any, Any, Any]:
         """State table lives in the target's database; the existence probe
@@ -491,7 +616,7 @@ class MySQLDestination(BaseSqlDestination):
             "key_json TEXT NOT NULL, "
             "scope_spec TEXT, "
             "scope_key TEXT, "
-            "PRIMARY KEY (sync_name, key_hash))"
+            "PRIMARY KEY (sync_name, key_hash)) ENGINE=InnoDB"
         )
 
     def _state_scope_columns_exist(self, cur: Any, scope: Any, raw: str) -> bool:

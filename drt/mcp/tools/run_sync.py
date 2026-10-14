@@ -27,6 +27,8 @@ def run_sync(
     full_refresh: bool = False,
     limit: int | None = None,
     vars: dict[str, Any] | None = None,
+    force_guards: bool = False,
+    approved_by: str | None = None,
 ) -> dict[str, Any]:
     from drt.cli._helpers import resolve_profile_name
     from drt.cli.main import _get_destination, _get_source
@@ -34,6 +36,15 @@ def run_sync(
     from drt.config.parser import project_vars as resolve_project_vars
     from drt.engine.sync import run_sync as engine_run_sync
     from drt.state.factory import build_state_bundle
+
+    approver = (approved_by or "").strip()
+    if force_guards and (not approver or len(approver) > 200):
+        return {
+            "error": (
+                "approved_by is required when force_guards=true: name the person "
+                "who approved the override."
+            )
+        }
 
     if compute_diff and not dry_run:
         return {
@@ -94,24 +105,42 @@ def run_sync(
             storage.delete(sync_name)
         state_mgr.reset(sync_name)
 
-    result = engine_run_sync(
-        sync,
-        source,
-        dest,
-        profile,
-        ctx.project_dir,
-        dry_run,
-        state_mgr,
-        cursor_value_override=(cursor_value if sync.sync.mode == "incremental" else None),
-        compute_diff=compute_diff,
-        diff_limit=diff_limit,
-        extract_limit=limit,
-        vars=resolved_vars,
-        idempotency_ledger=bundle.ledger,
-        audit_trail=bundle.audit_trail,
-        audit_fields=project.state.audit_trail.fields,
-        audit_retain_days=project.state.audit_trail.retain_days or 30,
-    )
+    try:
+        result = engine_run_sync(
+            sync,
+            source,
+            dest,
+            profile,
+            ctx.project_dir,
+            dry_run,
+            state_mgr,
+            cursor_value_override=(cursor_value if sync.sync.mode == "incremental" else None),
+            compute_diff=compute_diff,
+            diff_limit=diff_limit,
+            extract_limit=limit,
+            vars=resolved_vars,
+            idempotency_ledger=bundle.ledger,
+            audit_trail=bundle.audit_trail,
+            audit_fields=project.state.audit_trail.fields,
+            audit_retain_days=project.state.audit_trail.retain_days or 30,
+            force_guards=force_guards,
+        )
+    except Exception as exc:
+        from drt.engine.guards import GuardTripped
+
+        if not isinstance(exc, GuardTripped):
+            raise
+        return {
+            "sync_name": sync_name,
+            "dry_run": dry_run,
+            "success": 0,
+            "failed": 1,
+            "errors": [str(exc)],
+            "guards": {
+                "tripped": [trip.to_dict() for trip in exc.trips],
+                "forced": False,
+            },
+        }
 
     response: dict[str, Any] = {
         "sync_name": sync_name,
@@ -122,6 +151,11 @@ def run_sync(
     }
     if getattr(result, "limit_applied", None) is not None:
         response["limit_applied"] = result.limit_applied
+    guards_outcome = getattr(result, "guards", None)
+    if guards_outcome is not None:
+        response["guards"] = guards_outcome
+    if force_guards:
+        response["approved_by"] = approver
     diff_value = getattr(result, "diff", None)
     if compute_diff and diff_value is not None:
         from drt.cli.output import diff_to_dict
