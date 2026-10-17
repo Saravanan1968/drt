@@ -8,6 +8,9 @@ reads as "within limits".
 
 from __future__ import annotations
 
+import logging
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -54,6 +57,25 @@ class GuardOutcomeUncertain(GuardTripped):
             "Change guards tripped, but rollback failed; the destination outcome is "
             "uncertain and the DELETE may have taken effect: "
             f"{type(rollback_error).__name__}: {rollback_error}",
+        )
+
+
+class GuardOutcomeCommitted(GuardTripped):
+    """A guard tripped only after a non-transactional DELETE had already run.
+
+    Delta has no multi-statement rollback: the pre-DELETE count passed, but the
+    statement then removed more rows than the guard allows (a concurrent writer),
+    or its row count could not be read back. The deletion is committed.
+    """
+
+    def __init__(self, trips: list[GuardTrip], detail: str) -> None:
+        self.trips = trips
+        self.replan_required = False
+        Exception.__init__(
+            self,
+            "Change guards tripped AFTER the DELETE ran; it is already committed "
+            "(this destination has no rollback; consider RESTORE TABLE ... TO VERSION AS OF): "
+            + detail,
         )
 
 
@@ -221,3 +243,23 @@ def enforce_delete_guards(
         if unreviewed:
             raise GuardTripped(unreviewed, replan_required=True)
     return trips
+
+
+def run_cleanup_preserving_guard(cleanup: Callable[[], Any]) -> None:
+    """Run best-effort cleanup from a ``finally`` without replacing a guard refusal.
+
+    If a :class:`GuardTripped` is the active exception and the cleanup itself
+    fails, the refusal wins and the cleanup failure is logged. With no guard
+    refusal in flight, a cleanup failure propagates exactly as before.
+    """
+    active = sys.exc_info()[1]
+    try:
+        cleanup()
+    except Exception as exc:
+        if not isinstance(active, GuardTripped):
+            raise
+        logging.getLogger(__name__).warning(
+            "cleanup failed while preserving a change-guard refusal: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
