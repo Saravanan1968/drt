@@ -330,6 +330,8 @@ class PipedriveDestinationConfig(DescribableConfig):
     type: Literal["pipedrive"]
     api_token: str | None = None
     api_token_env: str | None = "PIPEDRIVE_API_TOKEN"
+    # Default is https://api.pipedrive.com/api/v2; override for a different host.
+    base_url: str | None = None
     object: Literal["person"] = "person"  # organization / deal come in follow-up PRs
     match_field: Literal["email", "name", "phone"] = "email"
     retry: RetryConfig | None = None  # destination-level override of sync.retry
@@ -342,6 +344,13 @@ class PipedriveDestinationConfig(DescribableConfig):
         """Per Pipedrive API token (#769)."""
         account = self.api_token_env or (LITERAL_CREDENTIAL_KEY if self.api_token else "unset")
         return f"{self.type}:{account}"
+
+    @field_validator("base_url", mode="after")
+    @classmethod
+    def _check_base_url(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith(("http://", "https://")):
+            raise ValueError("base_url must start with http:// or https://.")
+        return value
 
     @model_validator(mode="after")
     def _check_api_token(self) -> PipedriveDestinationConfig:

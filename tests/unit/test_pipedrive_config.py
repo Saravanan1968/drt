@@ -34,3 +34,9 @@ def test_parses_from_a_sync_dict() -> None:
         }
     )
     assert isinstance(sync.destination, PipedriveDestinationConfig)
+
+
+def test_base_url_defaults_to_none_and_must_be_http() -> None:
+    assert PipedriveDestinationConfig(type="pipedrive").base_url is None
+    with pytest.raises(ValidationError, match="base_url"):
+        PipedriveDestinationConfig(type="pipedrive", base_url="ftp://example.com")

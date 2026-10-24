@@ -279,3 +279,82 @@ def test_record_without_the_match_value_is_a_row_error(
 
     assert (result.success, result.failed) == (0, 1)
     assert httpserver.log == []
+
+
+def test_unknown_custom_field_key_is_a_row_error_from_the_api(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(_search_result())
+    httpserver.expect_request(_PERSONS, method="POST").respond_with_json(
+        {"success": False, "error": "Unknown custom field key: bogus_key"}, status=400
+    )
+    _use_server(httpserver, monkeypatch)
+
+    record = {"name": "Ada", "email": "ada@example.com", "bogus_key": "x"}
+    result = PipedriveDestination().load([record], _config(), _options())
+
+    assert (result.success, result.failed) == (0, 1)
+    assert result.row_errors[0].http_status == 400
+    assert "Unknown custom field key" in result.row_errors[0].error_message
+    assert _body(httpserver, 1)["custom_fields"] == {"bogus_key": "x"}  # sent, not dropped
+
+
+@pytest.mark.parametrize(
+    ("on_error", "expected_failed", "expected_calls"), [("skip", 2, 2), ("fail", 1, 1)]
+)
+def test_ambiguous_match_follows_on_error(
+    httpserver: HTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
+    on_error: str,
+    expected_failed: int,
+    expected_calls: int,
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(_search_result(42, 43))
+    _use_server(httpserver, monkeypatch)
+
+    records = [_RECORD, {"name": "Grace", "email": "grace@example.com"}]
+    result = PipedriveDestination().load(records, _config(), _options(on_error=on_error))
+
+    assert (result.success, result.failed) == (0, expected_failed)
+    assert len(httpserver.log) == expected_calls
+    assert {method for method, _ in _calls(httpserver)} == {"GET"}  # nothing was written
+
+
+def test_base_url_override_is_used_and_the_token_stays_out_of_the_url(
+    httpserver: HTTPServer,
+) -> None:
+    httpserver.expect_request("/custom/v2/persons/search", method="GET").respond_with_json(
+        _search_result()
+    )
+    httpserver.expect_request("/custom/v2/persons", method="POST").respond_with_json(
+        {"success": True, "data": {"id": 11}}
+    )
+    config = _config(base_url=httpserver.url_for("/custom/v2/"))  # trailing slash is tolerated
+
+    result = PipedriveDestination().load([_RECORD], config, _options())
+
+    assert (result.success, result.failed) == (1, 0)
+    assert _calls(httpserver) == [
+        ("GET", "/custom/v2/persons/search"),
+        ("POST", "/custom/v2/persons"),
+    ]
+    for request, _response in httpserver.log:
+        assert request.headers["x-api-token"] == "test-token"
+        assert "api_token" not in request.args
+
+
+def test_create_response_without_an_id_blocks_a_repeat_row(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(_search_result())
+    httpserver.expect_request(_PERSONS, method="POST").respond_with_json(
+        {"success": True, "data": {}}
+    )
+    _use_server(httpserver, monkeypatch)
+
+    records = [_RECORD, {"name": "Ada L.", "email": "ADA@example.com"}]
+    result = PipedriveDestination().load(records, _config(), _options())
+
+    assert (result.success, result.failed) == (1, 1)
+    assert "had no id" in result.row_errors[0].error_message
+    assert _calls(httpserver) == [("GET", _SEARCH), ("POST", _PERSONS)]  # no duplicate create

@@ -7,10 +7,14 @@ POSTed when not found. Only ``object: person`` is supported for now.
 Row -> payload mapping (columns arrive already renamed by ``sync.field_mappings``):
 - ``name``, ``owner_id``, ``org_id``, ``visible_to``, ``label_ids`` pass through;
 - ``email`` / ``phone`` become Pipedrive's ``emails`` / ``phones`` lists;
-- every other column goes into ``custom_fields`` (Pipedrive's 40-character keys).
+- every other column goes into ``custom_fields``, so ``field_mappings`` must rename it to
+  Pipedrive's 40-character field key. An unknown key is rejected by Pipedrive and surfaces
+  as a per-row error carrying the API's message; nothing is silently dropped.
 
-Cost: each row spends about 20 API tokens on the search plus 5 on the write.
-Repeated match values within one run are remembered, so they are searched once.
+The token is sent in the ``x-api-token`` header, never in the URL, so it cannot end up in
+request logs. Each row spends about 20 API tokens on the search plus 5 on the write.
+Repeated match values within one run are remembered: a second row with the same key
+updates the person the first row just created instead of creating a duplicate.
 """
 
 from __future__ import annotations
@@ -90,11 +94,13 @@ class _PipedriveApi:
     def __init__(
         self,
         client: httpx.Client,
+        base_url: str,
         headers: dict[str, str],
         limiter: RateLimiterBackend,
         retry_config: RetryConfig,
     ) -> None:
         self._client = client
+        self._base_url = base_url
         self._headers = headers
         self._limiter = limiter
         self._retry = retry_config
@@ -104,7 +110,7 @@ class _PipedriveApi:
 
         def send() -> httpx.Response:
             response = self._client.request(
-                method, f"{_PIPEDRIVE_API}{path}", headers=self._headers, **kwargs
+                method, f"{self._base_url}{path}", headers=self._headers, **kwargs
             )
             response.raise_for_status()
             return response
@@ -166,11 +172,14 @@ class PipedriveDestination:
             )
 
         result = SyncResult()
-        # match value (case-folded) -> person id, for rows found or created in this run
-        known_ids: dict[str, int] = {}
+        base_url = (config.base_url or _PIPEDRIVE_API).rstrip("/")
+        # match value (case-folded) -> person id, for rows found or created in this run.
+        # None means "created in this run, but Pipedrive did not return the id".
+        known_ids: dict[str, int | None] = {}
         with httpx.Client(timeout=30.0) as client:
             api = _PipedriveApi(
                 client,
+                base_url,
                 {"x-api-token": token, "Accept": "application/json"},
                 resolve_rate_limiter(config, sync_options),
                 resolve_retry(config.retry, sync_options),
@@ -203,7 +212,7 @@ class PipedriveDestination:
         config: PipedriveDestinationConfig,
         policy: str,
         record: dict[str, Any],
-        known_ids: dict[str, int],
+        known_ids: dict[str, int | None],
         result: SyncResult,
     ) -> None:
         raw = record.get(config.match_field)
@@ -214,8 +223,15 @@ class PipedriveDestination:
             )
         cache_key = term.casefold()
 
-        person_id = known_ids.get(cache_key)
-        if person_id is None:
+        person_id: int | None = None
+        if cache_key in known_ids:
+            person_id = known_ids[cache_key]
+            if person_id is None:
+                raise ValueError(
+                    "Pipedrive: an earlier row in this run created this person but the "
+                    "response had no id; not writing, to avoid creating a duplicate."
+                )
+        else:
             matches = api.search(term, config.match_field)
             if len(matches) > 1:
                 raise ValueError(
@@ -231,9 +247,7 @@ class PipedriveDestination:
                 result.skipped += 1
                 result.skipped_no_match += 1
                 return
-            created_id = api.create(_build_payload(record, creating=True))
-            if created_id is not None:
-                known_ids[cache_key] = created_id
+            known_ids[cache_key] = api.create(_build_payload(record, creating=True))
         else:
             if policy == "create_only":
                 result.skipped += 1
