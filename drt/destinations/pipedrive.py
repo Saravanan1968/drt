@@ -13,7 +13,7 @@ Row -> payload mapping (columns arrive already renamed by ``sync.field_mappings`
 
 The token is sent in the ``x-api-token`` header, never in the URL, so it cannot end up in
 request logs. Each row spends about 20 API tokens on the search plus 5 on the write.
-Repeated match values within one run are remembered: a second row with the same key
+Repeated match values within one batch are remembered: a second row with the same key
 updates the person the first row just created instead of creating a duplicate.
 """
 
@@ -173,8 +173,8 @@ class PipedriveDestination:
 
         result = SyncResult()
         base_url = (config.base_url or _PIPEDRIVE_API).rstrip("/")
-        # match value (case-folded) -> person id, for rows found or created in this run.
-        # None means "created in this run, but Pipedrive did not return the id".
+        # match value (case-folded) -> person id, for rows found or created in this batch.
+        # None means "created in this batch, but Pipedrive did not return the id".
         known_ids: dict[str, int | None] = {}
         with httpx.Client(timeout=30.0) as client:
             api = _PipedriveApi(
