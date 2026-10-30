@@ -358,3 +358,64 @@ def test_create_response_without_an_id_blocks_a_repeat_row(
     assert (result.success, result.failed) == (1, 1)
     assert "had no id" in result.row_errors[0].error_message
     assert _calls(httpserver) == [("GET", _SEARCH), ("POST", _PERSONS)]  # no duplicate create
+
+
+def test_unreadable_search_response_is_a_row_error_and_writes_nothing(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(
+        {"success": True, "data": {}}
+    )
+    _use_server(httpserver, monkeypatch)
+
+    result = PipedriveDestination().load([_RECORD], _config(), _options())
+
+    assert (result.success, result.failed) == (0, 1)
+    assert "no usable data.items" in result.row_errors[0].error_message
+    assert _calls(httpserver) == [("GET", _SEARCH)]
+
+
+def test_search_item_without_an_id_is_a_row_error_and_writes_nothing(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(
+        {"success": True, "data": {"items": [{"result_score": 1.0, "item": {"type": "person"}}]}}
+    )
+    _use_server(httpserver, monkeypatch)
+
+    result = PipedriveDestination().load([_RECORD], _config(), _options())
+
+    assert (result.success, result.failed) == (0, 1)
+    assert "invalid item" in result.row_errors[0].error_message
+    assert _calls(httpserver) == [("GET", _SEARCH)]
+
+
+def test_update_with_nothing_but_the_match_column_is_skipped(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(_search_result(42))
+    _use_server(httpserver, monkeypatch)
+
+    result = PipedriveDestination().load([{"email": "ada@example.com"}], _config(), _options())
+
+    assert (result.success, result.skipped, result.failed) == (0, 1, 0)
+    assert result.skipped_no_match == 0
+    assert _calls(httpserver) == [("GET", _SEARCH)]  # no PATCH was sent
+
+
+def test_list_valued_phones_drop_empty_entries_and_mark_the_first_primary(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    httpserver.expect_request(_SEARCH, method="GET").respond_with_json(_search_result())
+    httpserver.expect_request(_PERSONS, method="POST").respond_with_json(
+        {"success": True, "data": {"id": 11}}
+    )
+    _use_server(httpserver, monkeypatch)
+
+    record = {"name": "Ada", "email": "ada@example.com", "phones": ["555", "", None, "666"]}
+    PipedriveDestination().load([record], _config(), _options())
+
+    assert _body(httpserver, 1)["phones"] == [
+        {"value": "555", "primary": True},
+        {"value": "666"},
+    ]
